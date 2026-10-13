@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  merge_group:
+
+permissions:
+  contents: read
+
+# 权威 gate：远端 self-hosted runner 上的 pinned CI（配合 merge train；见
+# AGENTS.template.md）。merge_group 事件留给将来的原生 merge queue。
+#
+# 全局串行：同一时刻至多一个全量 CI。并发全量 CI 在共享宿主机上会让测试
+# 相位重叠（产出仓库实测 load 48-70、下游服务负载 flake 反复打红多个 PR）。
+# 排队在上游 GitHub 侧等待——不占 runner、不占门；lane2 只是 lane1 的故障
+# 切换，不是并行容量。
+concurrency:
+  group: ci-serial
+  # 必须为 false：取消一个持锁跑门的在途 run 会把 gate owner 留在未结算
+  # 状态（产出仓库两次事故：cancel 后 owner 卡 ACTIVE，全机 CI 被阻塞，
+  # 需 parent 授权 reset-gate-lane.mjs 才能恢复）。
+  cancel-in-progress: false
+
+jobs:
+  pinned-ci:
+    # 只在 ci:remote 本身被添加时因 label 事件触发；ready-to-merge 等其它
+    # label 事件不触发冗余全量 CI（入队 label 重跑 CI 会与既有绿 check 抢
+    # 门，且可能被负载 flake 打红导致误摘牌）。
+    if: >-
+      github.event_name == 'merge_group' ||
+      (
+        contains(github.event.pull_request.labels.*.name, 'ci:remote') &&
+        (
+          github.event_name != 'pull_request' ||
+          github.event.action != 'labeled' ||
+          github.event.label.name == 'ci:remote'
+        )
+      )
+    # 换成你自己的 self-hosted runner label 组，例如 [self-hosted, your-team]
+    runs-on: [self-hosted]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        # actions 版本按你 runner 的 Node 环境选择并 pin 到完整 SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Provide canonical .env
+        # canonical env 由运维放到 runner 主机的固定路径（CI 不经手 secrets）。
+        # 路径可用 CI_ENV_FILE 覆盖。
+        run: |
+          set -eu
+          CI_ENV_FILE=${CI_ENV_FILE:-/opt/ci-env/env}
+          if [ ! -f "$CI_ENV_FILE" ]; then
+            echo "::error::canonical CI env missing: $CI_ENV_FILE (see README → Operations)"
+            exit 1
+          fi
+          cp "$CI_ENV_FILE" "$GITHUB_WORKSPACE/.env"
+
+      - name: Remove stale CI worktree lock (checkout clean never cleans .git/)
+        # 被取消/被杀的 job 会把 CI lock 残留在 workspace 的 .git/ 里
+        # （git clean 不清 .git 内部），下一个 job 会以 EEXIST 失败；runner 上
+        # job 串行执行，job 开始时存在的锁必然是残留物，可安全移除。
+        run: rm -f "$GITHUB_WORKSPACE/.git/pinned-ci.lock"
+
+      - name: Run pinned local CI (retry across gate lanes)
+        # 双车道：lane1 分配必在；lane2 分配在初始化完成前可能缺失，
+        # 驱动脚本会自动退化为单车道（scripts/ci/ci-lane-retry.sh）。
+        # 门锁忙的判别与真实失败的区分在脚本内（结构性判据，不枚举错误串）。
+        env:
+          CI_RUNNER: ${{ vars.CI_RUNNER_ENTRY || '/opt/ci-env/bin/run-ci.sh' }}
+          CI_ALLOC_DIR: ${{ vars.CI_ALLOC_DIR || '/opt/ci-env/allocations' }}
+        run: |
+          set -o pipefail
+          bash scripts/ci/ci-lane-retry.sh "$GITHUB_WORKSPACE" \
+            "$CI_ALLOC_DIR/lane1.json" \
+            "$CI_ALLOC_DIR/lane2.json"

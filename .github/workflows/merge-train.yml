@@ -1,0 +1,35 @@
+name: merge-train
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read # check-runs 查询（缺失时 API 403 → check_state 误报 missing → 空转轮询）
+
+concurrency:
+  group: merge-train
+  cancel-in-progress: false
+
+jobs:
+  drive:
+    # ready-to-merge label 入队；workflow_dispatch 手动全量扫队列（恢复/清队）
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'ready-to-merge'
+    # 换成你自己的 self-hosted runner label 组，需与 ci.yml 一致
+    runs-on: [self-hosted]
+    timeout-minutes: 150
+    steps:
+      - name: Checkout (full history for train merges)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Drive merge train
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci/merge-train.sh "$GITHUB_REPOSITORY"
